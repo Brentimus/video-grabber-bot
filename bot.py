@@ -3,18 +3,25 @@ import re
 import logging
 import tempfile
 import asyncio
+from pathlib import Path
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yt_dlp
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+MAX_HEIGHT = int(os.environ.get("MAX_HEIGHT", "360"))
+MAX_FILE_SIZE = 50 * 1024 * 1024  # Telegram limit 50 MB
+
 YT_REGEX = re.compile(
-    r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})'
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})"
 )
-MAX_FILE_SIZE = 50 * 1024 * 1024  # Telegram limit 50MB
 
 
 def extract_youtube_urls(text: str) -> list[str]:
@@ -22,7 +29,7 @@ def extract_youtube_urls(text: str) -> list[str]:
     return [f"https://www.youtube.com/watch?v={vid}" for vid in dict.fromkeys(matches)]
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
@@ -34,13 +41,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_and_send(update, url)
 
 
-async def download_and_send(update: Update, url: str):
+async def download_and_send(update: Update, url: str) -> None:
     msg = await update.message.reply_text("Скачиваю видео...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "video.mp4")
         ydl_opts = {
-            "format": "best[height<=360][ext=mp4]/bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360]",
+            "format": (
+                f"best[height<={MAX_HEIGHT}][ext=mp4]/"
+                f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"best[height<={MAX_HEIGHT}]"
+            ),
             "outtmpl": output_path,
             "merge_output_format": "mp4",
             "quiet": True,
@@ -52,37 +63,42 @@ async def download_and_send(update: Update, url: str):
             loop = asyncio.get_event_loop()
             info = await loop.run_in_executor(None, lambda: _download(ydl_opts, url))
         except Exception as e:
-            logger.error(f"Download failed: {e}")
+            logger.error("Download failed for %s: %s", url, e)
             await msg.edit_text(f"Не удалось скачать: {e}")
             return
 
-        # yt-dlp may add extension
-        if not os.path.exists(output_path):
-            files = os.listdir(tmpdir)
-            if files:
-                output_path = os.path.join(tmpdir, files[0])
-            else:
-                await msg.edit_text("Файл не найден после скачивания.")
-                return
+        final_path = _resolve_output(tmpdir, output_path)
+        if final_path is None:
+            await msg.edit_text("Файл не найден после скачивания.")
+            return
 
-        file_size = os.path.getsize(output_path)
-        if file_size > MAX_FILE_SIZE:
-            await msg.edit_text("Видео слишком большое (>50MB) для Telegram.")
+        if final_path.stat().st_size > MAX_FILE_SIZE:
+            await msg.edit_text("Видео слишком большое (>50 MB) для Telegram.")
             return
 
         title = info.get("title", "video")[:200]
         try:
-            await update.message.reply_video(
-                video=open(output_path, "rb"),
-                caption=title,
-                read_timeout=120,
-                write_timeout=120,
-                supports_streaming=True,
-            )
+            with open(final_path, "rb") as video_file:
+                await update.message.reply_video(
+                    video=video_file,
+                    caption=title,
+                    read_timeout=120,
+                    write_timeout=120,
+                    supports_streaming=True,
+                )
             await msg.delete()
         except Exception as e:
-            logger.error(f"Send failed: {e}")
+            logger.error("Send failed for %s: %s", url, e)
             await msg.edit_text(f"Не удалось отправить: {e}")
+
+
+def _resolve_output(tmpdir: str, expected: str) -> Path | None:
+    """Return the actual downloaded file path (yt-dlp may change the extension)."""
+    path = Path(expected)
+    if path.exists():
+        return path
+    files = list(Path(tmpdir).iterdir())
+    return files[0] if files else None
 
 
 def _download(opts: dict, url: str) -> dict:
@@ -90,7 +106,7 @@ def _download(opts: dict, url: str) -> dict:
         return ydl.extract_info(url, download=True)
 
 
-def main():
+def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started")
