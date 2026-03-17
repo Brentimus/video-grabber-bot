@@ -31,12 +31,19 @@ TT_REGEX = re.compile(
     r"|https?://(?:vm|vt)\.tiktok\.com/[\w]+"
 )
 
+IG_REGEX = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[\w-]+"
+)
+
+COOKIES_PATH = Path("/app/cookies.txt")
+
 
 def extract_urls(text: str) -> list[str]:
     yt_matches = YT_REGEX.findall(text)
     yt_urls = [f"https://www.youtube.com/watch?v={vid}" for vid in dict.fromkeys(yt_matches)]
     tt_urls = list(dict.fromkeys(TT_REGEX.findall(text)))
-    return yt_urls + tt_urls
+    ig_urls = list(dict.fromkeys(IG_REGEX.findall(text)))
+    return yt_urls + tt_urls + ig_urls
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -57,7 +64,8 @@ async def download_and_send(update: Update, url: str) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "video.mp4")
         is_tiktok = "tiktok.com" in url
-        if is_tiktok:
+        is_instagram = "instagram.com" in url
+        if is_tiktok or is_instagram:
             fmt = "bestvideo*+bestaudio/best"
         else:
             fmt = (
@@ -70,14 +78,14 @@ async def download_and_send(update: Update, url: str) -> None:
             "format": fmt,
             "outtmpl": output_path,
             "merge_output_format": "mp4",
-        }
-        if not is_tiktok:
-            ydl_opts["max_filesize"] = MAX_DOWNLOAD_SIZE
-        ydl_opts.update({
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
-        })
+        }
+        if not (is_tiktok or is_instagram):
+            ydl_opts["max_filesize"] = MAX_DOWNLOAD_SIZE
+        if is_instagram and COOKIES_PATH.exists():
+            ydl_opts["cookiefile"] = str(COOKIES_PATH)
 
         try:
             loop = asyncio.get_event_loop()
