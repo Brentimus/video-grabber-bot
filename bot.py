@@ -26,17 +26,24 @@ YT_REGEX = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})"
 )
 
+TT_REGEX = re.compile(
+    r"https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+"
+    r"|https?://(?:vm|vt)\.tiktok\.com/[\w]+"
+)
 
-def extract_youtube_urls(text: str) -> list[str]:
-    matches = YT_REGEX.findall(text)
-    return [f"https://www.youtube.com/watch?v={vid}" for vid in dict.fromkeys(matches)]
+
+def extract_urls(text: str) -> list[str]:
+    yt_matches = YT_REGEX.findall(text)
+    yt_urls = [f"https://www.youtube.com/watch?v={vid}" for vid in dict.fromkeys(yt_matches)]
+    tt_urls = list(dict.fromkeys(TT_REGEX.findall(text)))
+    return yt_urls + tt_urls
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    urls = extract_youtube_urls(update.message.text)
+    urls = extract_urls(update.message.text)
     if not urls:
         return
 
@@ -49,20 +56,28 @@ async def download_and_send(update: Update, url: str) -> None:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "video.mp4")
-        ydl_opts = {
-            "format": (
+        is_tiktok = "tiktok.com" in url
+        if is_tiktok:
+            fmt = "bestvideo*+bestaudio/best"
+        else:
+            fmt = (
                 f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/"
                 f"best[height<={MAX_HEIGHT}][ext=mp4]/"
                 f"best[height<={MAX_HEIGHT}]"
-            ),
+            )
+        ydl_opts = {
+            "format": fmt,
             "outtmpl": output_path,
             "merge_output_format": "mp4",
-            "max_filesize": MAX_DOWNLOAD_SIZE,
+        }
+        if not is_tiktok:
+            ydl_opts["max_filesize"] = MAX_DOWNLOAD_SIZE
+        ydl_opts.update({
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
-        }
+        })
 
         try:
             loop = asyncio.get_event_loop()
