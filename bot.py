@@ -7,7 +7,7 @@ import subprocess
 import json
 from pathlib import Path
 
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, InlineQueryResultArticle, InlineQueryResultCachedVideo, InputTextMessageContent
 from telegram.ext import Application, MessageHandler, InlineQueryHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
 
@@ -79,69 +79,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await download_and_send(update, url)
 
 
+async def _download_video(url: str, tmpdir: str) -> tuple[Path, str]:
+    """Download video, compress if needed. Returns (file_path, title)."""
+    output_path = os.path.join(tmpdir, "video.mp4")
+    is_tiktok = "tiktok.com" in url
+    is_instagram = "instagram.com" in url
+    if is_tiktok or is_instagram:
+        fmt = "bestvideo*+bestaudio/best"
+    else:
+        fmt = (
+            f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/"
+            f"best[height<={MAX_HEIGHT}][ext=mp4]/"
+            f"best[height<={MAX_HEIGHT}]"
+        )
+    ydl_opts = {
+        "format": fmt,
+        "outtmpl": output_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+    }
+    if not (is_tiktok or is_instagram):
+        ydl_opts["max_filesize"] = MAX_DOWNLOAD_SIZE
+    if is_instagram and COOKIES_PATH.exists():
+        ydl_opts["cookiefile"] = str(COOKIES_PATH)
+
+    loop = asyncio.get_event_loop()
+    info = await loop.run_in_executor(None, lambda: _download(ydl_opts, url))
+
+    final_path = _resolve_output(tmpdir, output_path)
+    if final_path is None:
+        raise FileNotFoundError("Файл не найден после скачивания")
+
+    if final_path.stat().st_size > MAX_TG_SIZE:
+        compressed = Path(tmpdir) / "compressed.mp4"
+        ok = await loop.run_in_executor(
+            None, lambda: _compress(final_path, compressed, MAX_TG_SIZE)
+        )
+        if not ok:
+            raise RuntimeError("Видео слишком длинное, не удаётся сжать до 50 МБ")
+        final_path = compressed
+
+    title = info.get("title", "video")[:200]
+    return final_path, title
+
+
 async def download_and_send(update: Update, url: str) -> None:
     msg = await update.message.reply_text("Скачиваю видео...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_path = os.path.join(tmpdir, "video.mp4")
-        is_tiktok = "tiktok.com" in url
-        is_instagram = "instagram.com" in url
-        if is_tiktok or is_instagram:
-            fmt = "bestvideo*+bestaudio/best"
-        else:
-            fmt = (
-                f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/"
-                f"best[height<={MAX_HEIGHT}][ext=mp4]/"
-                f"best[height<={MAX_HEIGHT}]"
-            )
-        ydl_opts = {
-            "format": fmt,
-            "outtmpl": output_path,
-            "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 30,
-        }
-        if not (is_tiktok or is_instagram):
-            ydl_opts["max_filesize"] = MAX_DOWNLOAD_SIZE
-        if is_instagram and COOKIES_PATH.exists():
-            ydl_opts["cookiefile"] = str(COOKIES_PATH)
-
         try:
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: _download(ydl_opts, url))
+            final_path, title = await _download_video(url, tmpdir)
         except Exception as e:
             logger.error("Download failed for %s: %s", url, e)
-            await msg.edit_text(f"Не удалось скачать: {e}")
+            await msg.edit_text(f"Не удалось: {e}")
             return
 
-        final_path = _resolve_output(tmpdir, output_path)
-        if final_path is None:
-            await msg.edit_text("Файл не найден после скачивания.")
-            return
-
-        file_size = final_path.stat().st_size
-
-        if file_size > MAX_TG_SIZE:
-            await msg.edit_text("Сжимаю видео...")
-            compressed = Path(tmpdir) / "compressed.mp4"
-            try:
-                ok = await loop.run_in_executor(
-                    None, lambda: _compress(final_path, compressed, MAX_TG_SIZE)
-                )
-            except Exception as e:
-                logger.error("Compress failed for %s: %s", url, e)
-                await msg.edit_text(f"Не удалось сжать видео: {e}")
-                return
-
-            if not ok:
-                await msg.edit_text("Видео слишком длинное, не удаётся сжать до 50 МБ.")
-                return
-
-            final_path = compressed
-
-        title = info.get("title", "video")[:200]
         try:
             with open(final_path, "rb") as video_file:
                 await update.message.reply_video(
@@ -163,19 +158,6 @@ def _resolve_output(tmpdir: str, expected: str) -> Path | None:
         return path
     files = [f for f in Path(tmpdir).iterdir() if f.suffix != ".part"]
     return files[0] if files else None
-
-
-def _extract_info(url: str) -> dict:
-    """Extract video metadata without downloading."""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 10,
-    }
-    if "instagram.com" in url and COOKIES_PATH.exists():
-        opts["cookiefile"] = str(COOKIES_PATH)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
 
 
 def _download(opts: dict, url: str) -> dict:
@@ -224,7 +206,7 @@ def _is_admin(user_id: int) -> bool:
 
 
 async def _resolve_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str] | None:
-    """Resolve user from argument (@username or ID) or replied/forwarded message."""
+    """Resolve user from argument (@username or ID), forwarded or replied message."""
     if context.args:
         arg = context.args[0]
         if arg.startswith("@"):
@@ -232,7 +214,10 @@ async def _resolve_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> t
                 chat = await context.bot.get_chat(arg)
                 return chat.id, f"@{chat.username}" if chat.username else str(chat.id)
             except Exception:
-                await update.message.reply_text(f"Не удалось найти пользователя {arg}.")
+                await update.message.reply_text(
+                    f"Не удалось найти {arg}. Пользователь должен сначала написать боту.\n"
+                    "Или перешлите сообщение от этого пользователя и ответьте на него /allow"
+                )
                 return None
         try:
             uid = int(arg)
@@ -241,19 +226,35 @@ async def _resolve_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> t
             await update.message.reply_text("Укажите @username или числовой ID.")
             return None
 
-    reply = update.message.reply_to_message
-    if reply and reply.from_user:
-        u = reply.from_user
-        label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
-        return u.id, label
-    if reply and reply.forward_origin:
-        origin = reply.forward_origin
+    msg = update.message
+    # forwarded message sent directly (not as reply)
+    if msg.forward_origin:
+        origin = msg.forward_origin
         if hasattr(origin, "sender_user") and origin.sender_user:
             u = origin.sender_user
             label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
             return u.id, label
 
-    await update.message.reply_text("Использование: /allow @username или ID\nИли реплай на сообщение пользователя.")
+    # reply to someone's message or forwarded message
+    reply = msg.reply_to_message
+    if reply:
+        if reply.forward_origin:
+            origin = reply.forward_origin
+            if hasattr(origin, "sender_user") and origin.sender_user:
+                u = origin.sender_user
+                label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
+                return u.id, label
+        if reply.from_user:
+            u = reply.from_user
+            label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
+            return u.id, label
+
+    await update.message.reply_text(
+        "Способы указать пользователя:\n"
+        "• /allow @username — если пользователь писал боту\n"
+        "• /allow 123456789 — по числовому ID\n"
+        "• Перешлите сообщение от пользователя с подписью /allow"
+    )
     return None
 
 
@@ -303,26 +304,39 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not urls:
         return
 
-    results = []
-    for i, url in enumerate(urls[:3]):
-        try:
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda u=url: _extract_info(u))
-            title = info.get("title", "Video")[:200]
-            thumb = info.get("thumbnail")
-        except Exception as e:
-            logger.error("Inline extract failed for %s: %s", url, e)
-            title = "Скачать видео"
-            thumb = None
+    url = urls[0]
+    user_id = update.inline_query.from_user.id
 
-        kwargs = {"thumbnail_url": thumb} if thumb else {}
-        results.append(InlineQueryResultArticle(
-            id=str(i),
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            final_path, title = await _download_video(url, tmpdir)
+
+            with open(final_path, "rb") as f:
+                sent = await context.bot.send_video(
+                    chat_id=user_id,
+                    video=f,
+                    disable_notification=True,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+
+            file_id = sent.video.file_id
+            await context.bot.delete_message(user_id, sent.message_id)
+
+        results = [InlineQueryResultCachedVideo(
+            id="0",
+            video_file_id=file_id,
             title=title,
-            description="Отправить ссылку для скачивания",
+            caption=title,
+        )]
+    except Exception as e:
+        logger.error("Inline download failed for %s: %s", url, e)
+        results = [InlineQueryResultArticle(
+            id="0",
+            title="Не удалось скачать",
+            description=str(e)[:100],
             input_message_content=InputTextMessageContent(message_text=url),
-            **kwargs,
-        ))
+        )]
 
     await update.inline_query.answer(results, cache_time=300)
 
