@@ -7,8 +7,8 @@ import subprocess
 import json
 from pathlib import Path
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
+from telegram.ext import Application, MessageHandler, InlineQueryHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
 
 logging.basicConfig(
@@ -18,9 +18,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 MAX_HEIGHT = int(os.environ.get("MAX_HEIGHT", "720"))
 MAX_TG_SIZE = 50 * 1024 * 1024  # Telegram limit 50 MB
 MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024  # safety limit to not fill disk
+
+WHITELIST_PATH = Path(os.environ.get("WHITELIST_PATH", "/app/data/whitelist.json"))
+
+
+def _load_whitelist() -> set[int]:
+    if WHITELIST_PATH.exists():
+        return set(json.loads(WHITELIST_PATH.read_text()))
+    return set()
+
+
+def _save_whitelist(users: set[int]) -> None:
+    WHITELIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WHITELIST_PATH.write_text(json.dumps(sorted(users)))
+
+
+allowed_users: set[int] = _load_whitelist()
 
 YT_REGEX = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})"
@@ -28,6 +45,7 @@ YT_REGEX = re.compile(
 
 TT_REGEX = re.compile(
     r"https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+"
+    r"|https?://(?:www\.)?tiktok\.com/t/[\w]+"
     r"|https?://(?:vm|vt)\.tiktok\.com/[\w]+"
 )
 
@@ -48,6 +66,9 @@ def extract_urls(text: str) -> list[str]:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
+        return
+
+    if update.message.chat.type == "private" and allowed_users and update.message.from_user.id not in allowed_users:
         return
 
     urls = extract_urls(update.message.text)
@@ -144,6 +165,19 @@ def _resolve_output(tmpdir: str, expected: str) -> Path | None:
     return files[0] if files else None
 
 
+def _extract_info(url: str) -> dict:
+    """Extract video metadata without downloading."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 10,
+    }
+    if "instagram.com" in url and COOKIES_PATH.exists():
+        opts["cookiefile"] = str(COOKIES_PATH)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 def _download(opts: dict, url: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=True)
@@ -185,9 +219,121 @@ def _compress(src: Path, dst: Path, target_size: int) -> bool:
     return dst.exists() and dst.stat().st_size <= target_size
 
 
+def _is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+async def _resolve_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str] | None:
+    """Resolve user from argument (@username or ID) or replied/forwarded message."""
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("@"):
+            try:
+                chat = await context.bot.get_chat(arg)
+                return chat.id, f"@{chat.username}" if chat.username else str(chat.id)
+            except Exception:
+                await update.message.reply_text(f"Не удалось найти пользователя {arg}.")
+                return None
+        try:
+            uid = int(arg)
+            return uid, str(uid)
+        except ValueError:
+            await update.message.reply_text("Укажите @username или числовой ID.")
+            return None
+
+    reply = update.message.reply_to_message
+    if reply and reply.from_user:
+        u = reply.from_user
+        label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
+        return u.id, label
+    if reply and reply.forward_origin:
+        origin = reply.forward_origin
+        if hasattr(origin, "sender_user") and origin.sender_user:
+            u = origin.sender_user
+            label = f"@{u.username}" if u.username else f"{u.first_name} ({u.id})"
+            return u.id, label
+
+    await update.message.reply_text("Использование: /allow @username или ID\nИли реплай на сообщение пользователя.")
+    return None
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.message.from_user.id):
+        return
+    result = await _resolve_user(update, context)
+    if not result:
+        return
+    uid, label = result
+    allowed_users.add(uid)
+    _save_whitelist(allowed_users)
+    await update.message.reply_text(f"Пользователь {label} добавлен.")
+
+
+async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.message.from_user.id):
+        return
+    result = await _resolve_user(update, context)
+    if not result:
+        return
+    uid, label = result
+    allowed_users.discard(uid)
+    _save_whitelist(allowed_users)
+    await update.message.reply_text(f"Пользователь {label} удалён.")
+
+
+async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.message.from_user.id):
+        return
+    if not allowed_users:
+        await update.message.reply_text("Белый список пуст — ограничений нет.")
+        return
+    lines = [str(uid) for uid in sorted(allowed_users)]
+    await update.message.reply_text("Белый список:\n" + "\n".join(lines))
+
+
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed_users and update.inline_query.from_user.id not in allowed_users:
+        return
+
+    query = update.inline_query.query.strip()
+    if not query:
+        return
+
+    urls = extract_urls(query)
+    if not urls:
+        return
+
+    results = []
+    for i, url in enumerate(urls[:3]):
+        try:
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda u=url: _extract_info(u))
+            title = info.get("title", "Video")[:200]
+            thumb = info.get("thumbnail")
+        except Exception as e:
+            logger.error("Inline extract failed for %s: %s", url, e)
+            title = "Скачать видео"
+            thumb = None
+
+        kwargs = {"thumbnail_url": thumb} if thumb else {}
+        results.append(InlineQueryResultArticle(
+            id=str(i),
+            title=title,
+            description="Отправить ссылку для скачивания",
+            input_message_content=InputTextMessageContent(message_text=url),
+            **kwargs,
+        ))
+
+    await update.inline_query.answer(results, cache_time=300)
+
+
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("deny", cmd_deny))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(InlineQueryHandler(handle_inline_query))
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
